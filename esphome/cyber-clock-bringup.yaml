@@ -1,0 +1,188 @@
+# Cyber Clock (64x64 HUB75, sunnydodo.top ESP32 adapter) - BRING-UP config
+# Goal of this file: prove panel wiring/driver/memory work. Test patterns only, no clock face yet.
+# Pins were recovered from the stock firmware and verified on hardware (see ../README.md).
+#
+# Compile only:   esphome compile cyber-clock-bringup.yaml
+# Flash (USB):    esphome run cyber-clock-bringup.yaml --device /dev/cu.usbserial-0001
+# Tip:            back up the stock flash first (esptool read-flash, 230400 baud; 460800 fails on the CP2102)
+
+esphome:
+  name: cyber-clock
+  friendly_name: Cyber Clock
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Cyber Clock Fallback"
+    password: !secret ap_password
+
+# Real timezone database -> US daylight saving switches automatically (no patching).
+time:
+  - platform: sntp
+    id: local_time
+    timezone: America/Los_Angeles
+    servers:
+      - pool.ntp.org
+      - time.cloudflare.com
+
+globals:
+  - id: test_page
+    type: int
+    initial_value: "0"
+
+# Button U2 on the adapter board: GPIO32, internal pull-up, active LOW (stock firmware behaviour).
+# Short press cycles the test page.
+binary_sensor:
+  - platform: gpio
+    id: mode_button
+    name: "Mode Button"
+    pin:
+      number: GPIO32
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - lambda: |-
+          id(test_page) = (id(test_page) + 1) % 3;
+          ESP_LOGI("bringup", "test page -> %d", id(test_page));
+
+sensor:
+  - platform: dht
+    pin: GPIO33
+    model: DHT11
+    update_interval: 30s
+    temperature:
+      name: "Temperature"
+    humidity:
+      name: "Humidity"
+
+  # LDR on GPIO35 (ADC1_CH7). Raw voltage for now; mapping to brightness comes later.
+  - platform: adc
+    pin: GPIO35
+    name: "Light Level"
+    attenuation: 12db
+    update_interval: 5s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 1
+
+# Runtime brightness from Home Assistant (0-255). Starts LOW: full white on 64x64 draws a lot of current.
+number:
+  - platform: template
+    name: "Brightness"
+    id: panel_brightness
+    min_value: 0
+    max_value: 255
+    step: 1
+    initial_value: 40
+    optimistic: true
+    restore_value: true
+    on_value:
+      - hub75.set_brightness:
+          id: matrix
+          brightness: !lambda "return (int) x;"
+
+display:
+  - platform: hub75
+    id: matrix
+    panel_width: 64
+    panel_height: 64
+    # --- wiring recovered from stock firmware ---
+    r1_pin: GPIO25
+    g1_pin: GPIO26
+    b1_pin: GPIO27
+    r2_pin: GPIO14
+    g2_pin: GPIO12
+    b2_pin: GPIO13
+    a_pin: GPIO23
+    b_pin: GPIO19
+    c_pin: GPIO5
+    d_pin: GPIO17
+    e_pin: GPIO18          # 64-high panel => 1/32 scan => E line needed
+    lat_pin: GPIO4
+    oe_pin: GPIO15
+    clk_pin: GPIO16
+    # --- panel tuning (settle during bring-up) ---
+    scan_wiring: STANDARD_TWO_SCAN
+    shift_driver: GENERIC   # if image is garbled/dim/wrong colours try FM6126A (ICN2038S is an alias)
+    clock_speed: 10MHZ      # ESP32 I2S max is 10 MHz (log: 20 MHz request was clamped to 10)
+    bit_depth: 6            # lower than the default 8 to save internal SRAM (no PSRAM on this ESP32)
+    gamma_correct: CIE1931
+    double_buffer: true     # first flash used false + fill()-every-frame => visible pulsing. Buffer is only ~24KB.
+    brightness: 40
+    update_interval: 100ms
+    lambda: |-
+      const int W = 64, H = 64;
+      it.fill(Color(0, 0, 0));
+
+      // hue 0..360 -> RGB (full saturation/value)
+      auto hue = [](float h) -> Color {
+        float x = fmodf(h, 360.0f) / 60.0f;
+        float f = x - floorf(x);
+        uint8_t q = 255 * (1.0f - f), t = 255 * f;
+        switch ((int) x) {
+          case 0: return Color(255, t, 0);
+          case 1: return Color(q, 255, 0);
+          case 2: return Color(0, 255, t);
+          case 3: return Color(0, q, 255);
+          case 4: return Color(t, 0, 255);
+          default: return Color(255, 0, q);
+        }
+      };
+
+      if (id(test_page) == 0) {
+        // PAGE 0: colour bars + ramps + border + corner markers (colours, orientation, edges)
+        Color bars[8] = {Color(255,255,255), Color(255,255,0), Color(0,255,255), Color(0,255,0),
+                         Color(255,0,255), Color(255,0,0), Color(0,0,255), Color(60,60,60)};
+        for (int i = 0; i < 8; i++) it.filled_rectangle(i * 8, 2, 8, 20, bars[i]);
+        for (int x = 0; x < W; x++) {
+          uint8_t v = x * 4;
+          it.vertical_line(x, 24, 6, Color(v, 0, 0));    // red ramp
+          it.vertical_line(x, 30, 6, Color(0, v, 0));    // green ramp
+          it.vertical_line(x, 36, 6, Color(0, 0, v));    // blue ramp
+          it.vertical_line(x, 42, 6, Color(v, v, v));    // grey ramp
+          it.draw_pixel_at(x, 50, hue(x * 360.0f / W));  // hue sweep
+        }
+        it.rectangle(0, 0, W, H, Color(255, 255, 255));  // 1px border: all four edges should show
+        it.filled_rectangle(2, 2, 4, 4, Color(255, 0, 0));        // top-left red
+        it.filled_rectangle(W - 6, 2, 4, 4, Color(0, 255, 0));    // top-right green
+        it.filled_rectangle(2, H - 6, 4, 4, Color(0, 0, 255));    // bottom-left blue
+        it.filled_rectangle(W - 6, H - 6, 4, 4, Color(255, 255, 0)); // bottom-right yellow
+      } else if (id(test_page) == 1) {
+        // PAGE 1: row/column scan. Moving white row sweeps 0..63; if the E line is wrong,
+        // rows 32-63 will duplicate rows 0-31. Left edge: red = top half, blue = bottom half.
+        int row = (millis() / 120) % H;
+        int col = (millis() / 120) % W;
+        it.horizontal_line(0, row, W, Color(255, 255, 255));
+        it.vertical_line(col, 0, H, Color(0, 255, 0));
+        it.filled_rectangle(0, 0, 2, 32, Color(255, 0, 0));
+        it.filled_rectangle(0, 32, 2, 32, Color(0, 0, 255));
+        it.horizontal_line(0, 31, W, Color(60, 60, 0));   // half-way marker
+        it.horizontal_line(0, 32, W, Color(60, 60, 0));
+      } else {
+        // PAGE 2: full-screen rainbow that slowly rotates (checks every pixel + colour depth)
+        float shift = (millis() / 20) % 360;
+        for (int y = 0; y < H; y++)
+          for (int x = 0; x < W; x++)
+            it.draw_pixel_at(x, y, hue(shift + (x + y) * 360.0f / (W + H)));
+      }

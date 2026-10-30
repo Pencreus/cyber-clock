@@ -1,0 +1,9 @@
+# Whitelist: only publish the ESPHome config + docs.
+*
+!.gitignore
+!LICENSE
+!README.md
+!esphome/
+!esphome/cyber-clock.yaml
+!esphome/cyber-clock-bringup.yaml
+!esphome/secrets.yaml.example
